@@ -8,7 +8,19 @@ import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
-from app.database.models import Activity, DailySummary, DailyRecommendation, Category, OutcomeMarker, LifeEvent
+from app.database.models import (
+    Activity,
+    DailySummary,
+    DailyRecommendation,
+    Category,
+    OutcomeMarker,
+    LifeEvent,
+    EventCorrection,
+    LearnedRule,
+    RecommendationHistory,
+    StateSnapshot,
+    StateTransition,
+)
 
 
 class Database:
@@ -140,6 +152,94 @@ class Database:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS event_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    activity_id INTEGER NOT NULL,
+                    old_category TEXT NOT NULL,
+                    new_category TEXT NOT NULL,
+                    reason TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(activity_id) REFERENCES activities(id) ON DELETE CASCADE
+                )
+            """)
+
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS learned_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_type TEXT NOT NULL,
+                    rule_value TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    source TEXT DEFAULT 'manual_correction',
+                    confidence REAL DEFAULT 1.0,
+                    is_active INTEGER DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(rule_type, rule_value)
+                )
+            """)
+
+            self.cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_event_corrections_activity
+                ON event_corrections(activity_id)
+            """)
+
+            self.cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_learned_rules_lookup
+                ON learned_rules(rule_type, rule_value, is_active)
+            """)
+
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS recommendation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date DATE NOT NULL,
+                    title TEXT NOT NULL,
+                    category TEXT,
+                    priority TEXT DEFAULT 'normal',
+                    reason TEXT,
+                    feedback TEXT DEFAULT '',
+                    feedback_at DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            self._ensure_recommendation_history_columns()
+
+            self.cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_recommendation_history_date
+                ON recommendation_history(date DESC, created_at DESC)
+            """)
+
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS state_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date DATE NOT NULL,
+                    state_label TEXT NOT NULL,
+                    confidence REAL DEFAULT 0.0,
+                    feature_json TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS state_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date DATE NOT NULL,
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL,
+                    trigger TEXT DEFAULT 'system',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            self.cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_state_snapshots_date
+                ON state_snapshots(date DESC, created_at DESC)
+            """)
+
+            self.cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_state_transitions_date
+                ON state_transitions(date DESC, created_at DESC)
+            """)
             
             # Categories table - definition of categories
             self.cursor.execute("""
@@ -185,6 +285,16 @@ class Database:
             self.cursor.execute("ALTER TABLE activities ADD COLUMN on_ac_power INTEGER")
         if "is_online" not in existing_cols:
             self.cursor.execute("ALTER TABLE activities ADD COLUMN is_online INTEGER")
+
+    def _ensure_recommendation_history_columns(self):
+        """Ensure recommendation_history has latest feedback columns."""
+        self.cursor.execute("PRAGMA table_info(recommendation_history)")
+        existing_cols = {row[1] for row in self.cursor.fetchall()}
+
+        if "feedback" not in existing_cols:
+            self.cursor.execute("ALTER TABLE recommendation_history ADD COLUMN feedback TEXT DEFAULT ''")
+        if "feedback_at" not in existing_cols:
+            self.cursor.execute("ALTER TABLE recommendation_history ADD COLUMN feedback_at DATETIME")
     
     def _init_default_categories(self):
         """Initialize default activity categories"""
@@ -459,6 +569,37 @@ class Database:
         except sqlite3.Error as e:
             print(f"Get daily summary error: {e}")
             return None
+
+    def get_daily_summaries(self, days: int = 7) -> List[DailySummary]:
+        """Get recent daily summaries for multi-day recommendation context."""
+        try:
+            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            self.cursor.execute(
+                """
+                SELECT *
+                FROM daily_summaries
+                WHERE date >= ?
+                ORDER BY date DESC
+                """,
+                (start_date,),
+            )
+            rows = self.cursor.fetchall()
+            return [
+                DailySummary(
+                    id=row["id"],
+                    date=row["date"],
+                    total_active_time=row["total_active_time"],
+                    activity_count=row["activity_count"],
+                    top_category=row["top_category"],
+                    category_breakdown=json.loads(row["category_breakdown"] or "{}"),
+                    top_app=row["top_app"],
+                    created_at=datetime.fromisoformat(row["created_at"]),
+                )
+                for row in rows
+            ]
+        except sqlite3.Error as e:
+            print(f"Get daily summaries error: {e}")
+            return []
     
     def insert_daily_recommendation(self, recommendation: DailyRecommendation) -> int:
         """Insert or update daily recommendation"""
@@ -544,6 +685,60 @@ class Database:
         except sqlite3.Error as e:
             print(f"Get app summary error: {e}")
             return {}
+
+    def get_domain_summary(self, days: int = 7, limit: int = 10) -> Dict[str, int]:
+        """Get total time per domain for recent browser activities."""
+        try:
+            start_date = (datetime.now() - timedelta(days=days)).isoformat()
+            self.cursor.execute(
+                """
+                SELECT url_domain, SUM(duration_seconds) as total
+                FROM activities
+                WHERE start_time >= ? AND COALESCE(url_domain, '') != ''
+                GROUP BY url_domain
+                ORDER BY total DESC
+                LIMIT ?
+                """,
+                (start_date, limit),
+            )
+            result = {}
+            for row in self.cursor.fetchall():
+                result[row["url_domain"]] = row["total"]
+            return result
+        except sqlite3.Error as e:
+            print(f"Get domain summary error: {e}")
+            return {}
+
+    def get_daily_category_trends(self, days: int = 7) -> List[Dict]:
+        """Return per-day category totals for trend rendering in UI."""
+        try:
+            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            self.cursor.execute(
+                """
+                SELECT DATE(start_time) AS day, category, SUM(duration_seconds) AS total
+                FROM activities
+                WHERE DATE(start_time) >= ?
+                GROUP BY DATE(start_time), category
+                ORDER BY day DESC, total DESC
+                """,
+                (start_date,),
+            )
+            rows = self.cursor.fetchall()
+
+            day_map = {}
+            for row in rows:
+                day = row["day"]
+                if day not in day_map:
+                    day_map[day] = {"date": day, "categories": {}, "total": 0}
+                cat = row["category"] or "other"
+                seconds = int(row["total"] or 0)
+                day_map[day]["categories"][cat] = seconds
+                day_map[day]["total"] += seconds
+
+            return [day_map[key] for key in sorted(day_map.keys(), reverse=True)]
+        except sqlite3.Error as e:
+            print(f"Get daily category trends error: {e}")
+            return []
 
     def insert_outcome_marker(self, marker: OutcomeMarker) -> int:
         """Insert an outcome marker entry."""
@@ -677,6 +872,337 @@ class Database:
         except sqlite3.Error as e:
             print(f"Get life events error: {e}")
             return []
+
+    def get_recent_activities_for_review(
+        self,
+        days: int = 1,
+        limit: int = 300,
+        category: str = None,
+        search_text: str = None,
+    ) -> List[Dict]:
+        """Fetch recent activities with correction metadata for review workflows."""
+        try:
+            params = []
+            where_parts = ["a.start_time >= ?"]
+            since = (datetime.now() - timedelta(days=days)).isoformat()
+            params.append(since)
+
+            if category and category != "all":
+                where_parts.append("a.category = ?")
+                params.append(category)
+
+            if search_text:
+                where_parts.append("(LOWER(a.app_name) LIKE ? OR LOWER(COALESCE(a.window_title, '')) LIKE ? OR LOWER(COALESCE(a.url_domain, '')) LIKE ?)")
+                token = f"%{search_text.lower()}%"
+                params.extend([token, token, token])
+
+            where_clause = " AND ".join(where_parts)
+            query = f"""
+                SELECT
+                    a.id,
+                    a.start_time,
+                    a.end_time,
+                    a.app_name,
+                    a.window_title,
+                    a.url_domain,
+                    a.category,
+                    a.duration_seconds,
+                    EXISTS(
+                        SELECT 1
+                        FROM event_corrections ec
+                        WHERE ec.activity_id = a.id
+                    ) AS is_corrected
+                FROM activities a
+                WHERE {where_clause}
+                ORDER BY a.start_time DESC
+                LIMIT ?
+            """
+            params.append(limit)
+            self.cursor.execute(query, params)
+            rows = self.cursor.fetchall()
+
+            return [
+                {
+                    "id": row["id"],
+                    "start_time": row["start_time"],
+                    "end_time": row["end_time"],
+                    "app_name": row["app_name"] or "",
+                    "window_title": row["window_title"] or "",
+                    "url_domain": row["url_domain"] or "",
+                    "category": row["category"] or "other",
+                    "duration_seconds": row["duration_seconds"] or 0,
+                    "is_corrected": bool(row["is_corrected"]),
+                }
+                for row in rows
+            ]
+        except sqlite3.Error as e:
+            print(f"Get review activities error: {e}")
+            return []
+
+    def apply_category_correction(
+        self,
+        activity_ids: List[int],
+        new_category: str,
+        reason: str = "",
+        learn_app_rule: bool = False,
+        learn_domain_rule: bool = False,
+    ) -> int:
+        """Apply category correction to activities and persist correction history."""
+        if not activity_ids:
+            return 0
+        try:
+            updated_count = 0
+            placeholders = ",".join(["?"] * len(activity_ids))
+            self.cursor.execute(
+                f"""
+                SELECT id, app_name, url_domain, category
+                FROM activities
+                WHERE id IN ({placeholders})
+                """,
+                activity_ids,
+            )
+            rows = self.cursor.fetchall()
+            if not rows:
+                return 0
+
+            for row in rows:
+                old_category = row["category"] or "other"
+                if old_category == new_category:
+                    continue
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO event_corrections (activity_id, old_category, new_category, reason)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (row["id"], old_category, new_category, reason),
+                )
+
+                self.cursor.execute(
+                    "UPDATE activities SET category = ? WHERE id = ?",
+                    (new_category, row["id"]),
+                )
+                updated_count += 1
+
+                if learn_app_rule and row["app_name"]:
+                    self._upsert_learned_rule("app", row["app_name"].lower().strip(), new_category)
+
+                if learn_domain_rule and row["url_domain"]:
+                    self._upsert_learned_rule("domain", row["url_domain"].lower().strip(), new_category)
+
+            self.connection.commit()
+            return updated_count
+        except sqlite3.Error as e:
+            print(f"Apply correction error: {e}")
+            return 0
+
+    def _upsert_learned_rule(self, rule_type: str, rule_value: str, category: str):
+        """Insert or update a learned categorization rule."""
+        if not rule_value:
+            return
+        self.cursor.execute(
+            """
+            INSERT INTO learned_rules (rule_type, rule_value, category, source, confidence, is_active)
+            VALUES (?, ?, ?, 'manual_correction', 1.0, 1)
+            ON CONFLICT(rule_type, rule_value)
+            DO UPDATE SET
+                category = excluded.category,
+                confidence = CASE WHEN learned_rules.confidence < 0.95 THEN learned_rules.confidence + 0.05 ELSE 1.0 END,
+                is_active = 1
+            """,
+            (rule_type, rule_value, category),
+        )
+
+    def get_active_learned_rules(self) -> List[LearnedRule]:
+        """Return active learned rules for categorization overrides."""
+        try:
+            self.cursor.execute(
+                """
+                SELECT *
+                FROM learned_rules
+                WHERE is_active = 1
+                ORDER BY confidence DESC, created_at DESC
+                """
+            )
+            rows = self.cursor.fetchall()
+            return [
+                LearnedRule(
+                    id=row["id"],
+                    rule_type=row["rule_type"],
+                    rule_value=row["rule_value"],
+                    category=row["category"],
+                    source=row["source"] or "manual_correction",
+                    confidence=float(row["confidence"] or 1.0),
+                    is_active=bool(row["is_active"]),
+                    created_at=datetime.fromisoformat(row["created_at"]),
+                )
+                for row in rows
+            ]
+        except sqlite3.Error as e:
+            print(f"Get learned rules error: {e}")
+            return []
+
+    def get_correction_history(self, limit: int = 100) -> List[EventCorrection]:
+        """Return recent correction records for auditability in UI."""
+        try:
+            self.cursor.execute(
+                """
+                SELECT *
+                FROM event_corrections
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = self.cursor.fetchall()
+            return [
+                EventCorrection(
+                    id=row["id"],
+                    activity_id=row["activity_id"],
+                    old_category=row["old_category"],
+                    new_category=row["new_category"],
+                    reason=row["reason"] or "",
+                    created_at=datetime.fromisoformat(row["created_at"]),
+                )
+                for row in rows
+            ]
+        except sqlite3.Error as e:
+            print(f"Get correction history error: {e}")
+            return []
+
+    def insert_recommendation_history(self, item: RecommendationHistory) -> int:
+        """Insert a recommendation view record for repetition suppression logic."""
+        try:
+            self.cursor.execute(
+                """
+                INSERT INTO recommendation_history (date, title, category, priority, reason, feedback, feedback_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.date,
+                    item.title,
+                    item.category,
+                    item.priority,
+                    item.reason,
+                    item.feedback or "",
+                    item.feedback_at.isoformat() if isinstance(item.feedback_at, datetime) else item.feedback_at,
+                ),
+            )
+            self.connection.commit()
+            return self.cursor.lastrowid
+        except sqlite3.Error as e:
+            print(f"Insert recommendation history error: {e}")
+            return None
+
+    def get_recent_recommendation_history(self, days: int = 7, limit: int = 200) -> List[RecommendationHistory]:
+        """Fetch recent recommendation history records."""
+        try:
+            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            self.cursor.execute(
+                """
+                SELECT *
+                FROM recommendation_history
+                WHERE date >= ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (start_date, limit),
+            )
+            rows = self.cursor.fetchall()
+            return [
+                RecommendationHistory(
+                    id=row["id"],
+                    date=row["date"],
+                    title=row["title"],
+                    category=row["category"] or "other",
+                    priority=row["priority"] or "normal",
+                    reason=row["reason"] or "",
+                    feedback=row["feedback"] or "",
+                    feedback_at=datetime.fromisoformat(row["feedback_at"]) if row["feedback_at"] else None,
+                    created_at=datetime.fromisoformat(row["created_at"]),
+                )
+                for row in rows
+            ]
+        except sqlite3.Error as e:
+            print(f"Get recommendation history error: {e}")
+            return []
+
+    def set_recommendation_feedback(
+        self,
+        feedback: str,
+        history_id: int = None,
+        date: str = None,
+        title: str = None,
+    ) -> bool:
+        """Set feedback on a recommendation history row."""
+        if feedback not in {"accepted", "ignored"}:
+            return False
+        try:
+            timestamp = datetime.now().isoformat()
+            if history_id:
+                self.cursor.execute(
+                    """
+                    UPDATE recommendation_history
+                    SET feedback = ?, feedback_at = ?
+                    WHERE id = ?
+                    """,
+                    (feedback, timestamp, history_id),
+                )
+            elif date and title:
+                self.cursor.execute(
+                    """
+                    UPDATE recommendation_history
+                    SET feedback = ?, feedback_at = ?
+                    WHERE id = (
+                        SELECT id
+                        FROM recommendation_history
+                        WHERE date = ? AND title = ?
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    """,
+                    (feedback, timestamp, date, title),
+                )
+            else:
+                return False
+
+            self.connection.commit()
+            return self.cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Set recommendation feedback error: {e}")
+            return False
+
+    def insert_state_snapshot(self, snapshot: StateSnapshot) -> int:
+        """Insert a state snapshot for future transition modeling."""
+        try:
+            self.cursor.execute(
+                """
+                INSERT INTO state_snapshots (date, state_label, confidence, feature_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (snapshot.date, snapshot.state_label, snapshot.confidence, snapshot.feature_json),
+            )
+            self.connection.commit()
+            return self.cursor.lastrowid
+        except sqlite3.Error as e:
+            print(f"Insert state snapshot error: {e}")
+            return None
+
+    def insert_state_transition(self, transition: StateTransition) -> int:
+        """Insert a state transition record between snapshots."""
+        try:
+            self.cursor.execute(
+                """
+                INSERT INTO state_transitions (date, from_state, to_state, trigger)
+                VALUES (?, ?, ?, ?)
+                """,
+                (transition.date, transition.from_state, transition.to_state, transition.trigger),
+            )
+            self.connection.commit()
+            return self.cursor.lastrowid
+        except sqlite3.Error as e:
+            print(f"Insert state transition error: {e}")
+            return None
     
     def close(self):
         """Close database connection"""

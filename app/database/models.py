@@ -140,3 +140,63 @@ class LifeEvent:
     impact_level: str = "medium"  # low, medium, high
     created_at: datetime = field(default_factory=datetime.now)
 
+
+@dataclass
+class EventCorrection:
+    """Tracks manual corrections applied to activity categories."""
+    id: Optional[int] = None
+    activity_id: int = 0
+    old_category: str = "other"
+    new_category: str = "other"
+    reason: str = ""
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class LearnedRule:
+    """Simple user-learned categorization rule from corrections."""
+    id: Optional[int] = None
+    rule_type: str = "app"  # app, domain, title_keyword
+    rule_value: str = ""
+    category: str = "other"
+    source: str = "manual_correction"
+    confidence: float = 1.0
+    is_active: bool = True
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class RecommendationHistory:
+    """Stores recommendations that were surfaced to the user."""
+    id: Optional[int] = None
+    date: str = ""  # YYYY-MM-DD
+    title: str = ""
+    category: str = "other"
+    priority: str = "normal"
+    reason: str = ""
+    feedback: str = ""  # accepted, ignored, or empty
+    feedback_at: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class StateSnapshot:
+    """Heuristic life-state snapshot ready for transition modeling."""
+    id: Optional[int] = None
+    date: str = ""  # YYYY-MM-DD
+    state_label: str = "unknown"
+    confidence: float = 0.0
+    feature_json: str = "{}"
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class StateTransition:
+    """Transition record between inferred states."""
+    id: Optional[int] = None
+    date: str = ""  # YYYY-MM-DD
+    from_state: str = "unknown"
+    to_state: str = "unknown"
+    trigger: str = "system"
+    created_at: datetime = field(default_factory=datetime.now)
+

@@ -5,7 +5,7 @@ Generates personalized recommendations based on activity patterns and rules
 
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
-from app.database.models import DailySummary, DailyRecommendation, Activity
+from app.database.models import DailySummary, DailyRecommendation, Activity, RecommendationHistory
 
 
 class Recommender:
@@ -48,7 +48,10 @@ class Recommender:
         }
     
     def generate_recommendation(self, summary: DailySummary, 
-                               activities: List[Activity] = None) -> DailyRecommendation:
+                               activities: List[Activity] = None,
+                               historical_summaries: List[DailySummary] = None,
+                               recommendation_history: List[RecommendationHistory] = None,
+                               pattern_data: Dict = None) -> DailyRecommendation:
         """
         Generate a single daily recommendation
         
@@ -71,6 +74,7 @@ class Recommender:
         writing_time = categories.get("writing", 0)
         business_time = categories.get("business", 0)
         finance_time = categories.get("finance", 0)
+        distraction_time = social_time + entertainment_time
         deep_work_time = (
             coding_time
             + study_time
@@ -83,6 +87,12 @@ class Recommender:
         
         # List of candidate recommendations with scores
         candidates: List[Tuple[DailyRecommendation, int]] = []
+
+        historical_summaries = historical_summaries or []
+        recommendation_history = recommendation_history or []
+        pattern_data = pattern_data or {}
+
+        multi_day = self._compute_multi_day_features(historical_summaries)
         
         # Rule 1: Distraction warning
         if social_time > self.thresholds["social_media_high"] and deep_work_time < self.thresholds["coding_low"]:
@@ -173,6 +183,64 @@ class Recommender:
                 priority="normal"
             )
             candidates.append((recommendation, self.rule_weights["study_boost"]))
+
+        # Rule 8: Protect best focus window if available from pattern mining.
+        best_focus_hour = pattern_data.get("best_focus_hour")
+        if best_focus_hour is not None and deep_work_time > self.thresholds["coding_low"]:
+            recommendation = DailyRecommendation(
+                date=summary.date,
+                title="Protect Your Best Focus Window",
+                description=(
+                    f"Your strongest focus hour tends to be around {best_focus_hour:02d}:00. "
+                    "Reserve that window for your most important deep-work task tomorrow."
+                ),
+                category="coding",
+                priority="normal",
+            )
+            candidates.append((recommendation, 6))
+
+        # Rule 9: Distraction-window prevention based on recent patterns.
+        distraction_hour = pattern_data.get("top_distraction_hour")
+        if distraction_hour is not None and distraction_time > self.thresholds["social_media_low"]:
+            recommendation = DailyRecommendation(
+                date=summary.date,
+                title="Pre-Commit Before Distraction Window",
+                description=(
+                    f"You often drift into distractions near {distraction_hour:02d}:00. "
+                    "Set one clear task and timer before that period starts."
+                ),
+                category="social_media",
+                priority="normal",
+            )
+            candidates.append((recommendation, 7))
+
+        # Rule 10: Momentum streak reinforcement from multi-day deep-work consistency.
+        if multi_day["deep_work_streak_days"] >= 3:
+            recommendation = DailyRecommendation(
+                date=summary.date,
+                title="Keep Your Momentum Streak",
+                description=(
+                    f"You are on a {multi_day['deep_work_streak_days']}-day deep-work streak. "
+                    "Protect it with one non-negotiable focused block tomorrow."
+                ),
+                category="coding",
+                priority="normal",
+            )
+            candidates.append((recommendation, 8))
+
+        # Rule 11: Multi-day drift signal against rolling baseline.
+        if multi_day["distraction_delta_seconds"] > 45 * 60:
+            recommendation = DailyRecommendation(
+                date=summary.date,
+                title="Distraction Trend Rising",
+                description=(
+                    "Your distraction time is rising versus your recent baseline. "
+                    "Try a focused start block in your first hour tomorrow."
+                ),
+                category="social_media",
+                priority="high",
+            )
+            candidates.append((recommendation, 9))
         
         # Default: positive affirmation
         if not candidates:
@@ -189,6 +257,8 @@ class Recommender:
                 priority="normal"
             )
             candidates.append((recommendation, self.rule_weights["default_positive"]))
+
+        candidates = self._apply_repetition_suppression(candidates, recommendation_history)
         
         # Pick best recommendation by weight (if multiple match, pick highest priority)
         if candidates:
@@ -203,6 +273,94 @@ class Recommender:
             category="other",
             priority="normal"
         )
+
+    def _apply_repetition_suppression(
+        self,
+        candidates: List[Tuple[DailyRecommendation, int]],
+        recommendation_history: List[RecommendationHistory],
+    ) -> List[Tuple[DailyRecommendation, int]]:
+        """Penalize repetition and adapt scores based on accepted/ignored feedback."""
+        if not candidates or not recommendation_history:
+            return candidates
+
+        recent_titles = {}
+        ignored_titles = {}
+        accepted_titles = {}
+        category_feedback = {}
+        for item in recommendation_history:
+            key = (item.title or "").strip().lower()
+            if not key:
+                continue
+            recent_titles[key] = recent_titles.get(key, 0) + 1
+
+            category_key = (item.category or "other").strip().lower()
+            feedback = (item.feedback or "").strip().lower()
+            if feedback == "ignored":
+                ignored_titles[key] = ignored_titles.get(key, 0) + 1
+                category_feedback[category_key] = category_feedback.get(category_key, 0) - 1
+            elif feedback == "accepted":
+                accepted_titles[key] = accepted_titles.get(key, 0) + 1
+                category_feedback[category_key] = category_feedback.get(category_key, 0) + 1
+
+        adjusted = []
+        for rec, weight in candidates:
+            title_key = (rec.title or "").strip().lower()
+            category_key = (rec.category or "other").strip().lower()
+            seen_count = recent_titles.get(title_key, 0)
+            ignored_count = ignored_titles.get(title_key, 0)
+            accepted_count = accepted_titles.get(title_key, 0)
+
+            repetition_penalty = min(4, seen_count * 2)
+            ignore_penalty = min(4, ignored_count * 2)
+            acceptance_bonus = min(2, accepted_count)
+
+            category_delta_raw = category_feedback.get(category_key, 0)
+            category_delta = max(-2, min(2, category_delta_raw))
+
+            tuned = weight - repetition_penalty - ignore_penalty + acceptance_bonus + category_delta
+            adjusted.append((rec, max(1, tuned)))
+
+        # If everything is heavily penalized, still keep all candidates and let normal sorting pick best.
+        return adjusted
+
+    def _compute_multi_day_features(self, historical_summaries: List[DailySummary]) -> Dict[str, int]:
+        """Compute rolling baselines and streak signals for recommendation context."""
+        if not historical_summaries:
+            return {
+                "deep_work_streak_days": 0,
+                "distraction_delta_seconds": 0,
+            }
+
+        deep_categories = {"coding", "study", "research", "writing", "business", "finance"}
+        distraction_categories = {"social_media", "entertainment"}
+
+        ordered = sorted(historical_summaries, key=lambda s: s.date)
+        deep_daily = []
+        distraction_daily = []
+
+        for summary in ordered:
+            breakdown = summary.category_breakdown or {}
+            deep_val = sum(breakdown.get(cat, 0) for cat in deep_categories)
+            distraction_val = sum(breakdown.get(cat, 0) for cat in distraction_categories)
+            deep_daily.append(deep_val)
+            distraction_daily.append(distraction_val)
+
+        streak = 0
+        for val in reversed(deep_daily):
+            if val >= self.thresholds["coding_low"]:
+                streak += 1
+            else:
+                break
+
+        recent = distraction_daily[-3:] if len(distraction_daily) >= 3 else distraction_daily
+        baseline = distraction_daily[:-3] if len(distraction_daily) > 3 else distraction_daily
+        recent_avg = (sum(recent) / len(recent)) if recent else 0
+        baseline_avg = (sum(baseline) / len(baseline)) if baseline else 0
+
+        return {
+            "deep_work_streak_days": streak,
+            "distraction_delta_seconds": int(recent_avg - baseline_avg),
+        }
     
     def _find_longest_focus_session(self, activities: List[Activity]) -> int:
         """

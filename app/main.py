@@ -8,6 +8,7 @@ import sys
 import logging
 import re
 import subprocess
+import json
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -16,8 +17,19 @@ from app.config.settings import Settings
 from app.database.db import Database
 from app.collectors.local_monitor import LocalActivityMonitor
 from app.analysis.categorizer import Categorizer
+from app.analysis.correction_engine import CorrectionEngine
 from app.analysis.recommender import Recommender
-from app.database.models import Activity, DailySummary, OutcomeMarker, LifeEvent
+from app.services.export_service import ExportService
+from app.state.state_engine import StateEngine
+from app.database.models import (
+    Activity,
+    DailySummary,
+    OutcomeMarker,
+    LifeEvent,
+    RecommendationHistory,
+    StateSnapshot,
+    StateTransition,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,11 +50,19 @@ class MuruthiApp(tk.Tk):
         self.db = Database(self.settings.db_path)
         self.monitor = LocalActivityMonitor()
         self.categorizer = Categorizer()
+        self.correction_engine = CorrectionEngine(self.db)
         self.recommender = Recommender()
+        self.export_service = ExportService()
+        self.state_engine = StateEngine()
         
         self.last_logged_activity = None
         self.pending_segment = None
         self.last_flush_time = datetime.now()
+        self.last_recommendation_logged = None
+        self.last_recommendation_history_id = None
+        self.current_recommendation = None
+        self.last_state_label = None
+        self.current_review_events = []
         self.running = True
         
         self.setup_ui()
@@ -88,6 +108,14 @@ class MuruthiApp(tk.Tk):
         self.tab_life = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_life, text="Life & Outcomes")
         self.setup_life_tab()
+
+        self.tab_review = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_review, text="Review & Correct")
+        self.setup_review_tab()
+
+        self.tab_trends = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_trends, text="Trends & History")
+        self.setup_trends_tab()
         
         footer_frame = ttk.Frame(main_frame)
         footer_frame.pack(fill=tk.X)
@@ -152,6 +180,13 @@ class MuruthiApp(tk.Tk):
         self.insight_text = tk.Text(frame, height=15, width=80)
         self.insight_text.pack(fill=tk.BOTH, expand=True, pady=10)
 
+        feedback_actions = ttk.Frame(frame)
+        feedback_actions.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(feedback_actions, text="Helpful", command=self.mark_recommendation_helpful).pack(side=tk.LEFT)
+        ttk.Button(feedback_actions, text="Not Helpful", command=self.mark_recommendation_not_helpful).pack(side=tk.LEFT, padx=(8, 0))
+        self.recommendation_feedback_status = ttk.Label(feedback_actions, text="Feedback: pending")
+        self.recommendation_feedback_status.pack(side=tk.LEFT, padx=(14, 0))
+
     def setup_life_tab(self):
         frame = ttk.Frame(self.tab_life, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -203,6 +238,121 @@ class MuruthiApp(tk.Tk):
         ttk.Label(frame, text="Life Events (recent)", font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(4, 4))
         self.life_events_text = tk.Text(frame, height=10, width=100)
         self.life_events_text.pack(fill=tk.BOTH, expand=True)
+
+    def setup_review_tab(self):
+        """Setup workflow for reviewing and correcting category mistakes."""
+        frame = ttk.Frame(self.tab_review, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        controls = ttk.Frame(frame)
+        controls.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(controls, text="Window").pack(side=tk.LEFT)
+        self.review_days_var = tk.StringVar(value="1")
+        ttk.Combobox(
+            controls,
+            textvariable=self.review_days_var,
+            values=["1", "3", "7", "14"],
+            width=5,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(6, 12))
+
+        ttk.Label(controls, text="Category").pack(side=tk.LEFT)
+        category_values = ["all"] + self.categorizer.get_all_categories()
+        self.review_category_var = tk.StringVar(value="all")
+        ttk.Combobox(
+            controls,
+            textvariable=self.review_category_var,
+            values=category_values,
+            width=14,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(6, 12))
+
+        ttk.Label(controls, text="Search").pack(side=tk.LEFT)
+        self.review_search_var = tk.StringVar()
+        ttk.Entry(controls, textvariable=self.review_search_var, width=32).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Button(controls, text="Refresh", command=self.refresh_review_tab).pack(side=tk.LEFT)
+
+        self.review_tree = ttk.Treeview(
+            frame,
+            columns=("ID", "Time", "App", "Category", "Duration", "Domain", "Corrected", "Title"),
+            selectmode="extended",
+            height=14,
+        )
+        self.review_tree.column("#0", width=0, stretch=tk.NO)
+        self.review_tree.column("ID", anchor=tk.W, width=60)
+        self.review_tree.column("Time", anchor=tk.W, width=90)
+        self.review_tree.column("App", anchor=tk.W, width=130)
+        self.review_tree.column("Category", anchor=tk.W, width=110)
+        self.review_tree.column("Duration", anchor=tk.W, width=80)
+        self.review_tree.column("Domain", anchor=tk.W, width=140)
+        self.review_tree.column("Corrected", anchor=tk.W, width=85)
+        self.review_tree.column("Title", anchor=tk.W, width=460)
+
+        for heading in ("ID", "Time", "App", "Category", "Duration", "Domain", "Corrected", "Title"):
+            self.review_tree.heading(heading, text=heading, anchor=tk.W)
+
+        review_scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.review_tree.yview)
+        self.review_tree.configure(yscroll=review_scrollbar.set)
+        self.review_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        review_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        action_frame = ttk.Frame(frame)
+        action_frame.pack(fill=tk.X, pady=(8, 6))
+
+        ttk.Label(action_frame, text="Set selected to category").pack(side=tk.LEFT)
+        self.correct_to_category_var = tk.StringVar(value="coding")
+        ttk.Combobox(
+            action_frame,
+            textvariable=self.correct_to_category_var,
+            values=self.categorizer.get_all_categories(),
+            width=14,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(6, 10))
+
+        ttk.Label(action_frame, text="Reason").pack(side=tk.LEFT)
+        self.correction_reason_var = tk.StringVar()
+        ttk.Entry(action_frame, textvariable=self.correction_reason_var, width=30).pack(side=tk.LEFT, padx=(6, 10))
+
+        self.learn_app_var = tk.BooleanVar(value=True)
+        self.learn_domain_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(action_frame, text="Learn app rule", variable=self.learn_app_var).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(action_frame, text="Learn domain rule", variable=self.learn_domain_var).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(action_frame, text="Apply Correction", command=self.apply_review_correction).pack(side=tk.LEFT)
+
+        export_frame = ttk.Frame(frame)
+        export_frame.pack(fill=tk.X, pady=(2, 6))
+        self.sanitize_titles_var = tk.BooleanVar(value=False)
+        self.sanitize_domains_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(export_frame, text="Sanitize window titles", variable=self.sanitize_titles_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(export_frame, text="Sanitize domains", variable=self.sanitize_domains_var).pack(side=tk.LEFT, padx=(10, 8))
+        ttk.Button(export_frame, text="Export CSV", command=self.export_review_events_csv).pack(side=tk.LEFT, padx=(8, 6))
+        ttk.Button(export_frame, text="Export JSON", command=self.export_review_events_json).pack(side=tk.LEFT)
+
+        ttk.Label(frame, text="Recent Corrections", font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(8, 4))
+        self.review_history_text = tk.Text(frame, height=8, width=100)
+        self.review_history_text.pack(fill=tk.BOTH, expand=True)
+
+        self.refresh_review_tab(silent=True)
+
+    def setup_trends_tab(self):
+        """Setup daily/weekly trends and recommendation history view."""
+        frame = ttk.Frame(self.tab_trends, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Daily & Weekly Trends", font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        self.trends_text = tk.Text(frame, height=16, width=120)
+        self.trends_text.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        ttk.Label(frame, text="Recommendation History", font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        self.recommendation_history_text = tk.Text(frame, height=10, width=120)
+        self.recommendation_history_text.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        ttk.Label(frame, text="Capture Health Guide", font=("Arial", 12, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        self.capture_health_help_text = tk.Text(frame, height=8, width=120)
+        self.capture_health_help_text.pack(fill=tk.BOTH, expand=True)
+        self.update_trends_tab()
     
     def log_activity(self):
         if not self.running:
@@ -242,13 +392,17 @@ class MuruthiApp(tk.Tk):
                 if window_unknown:
                     window_title = '(no title)'
 
-                category = self.categorizer.categorize(
-                    app_name,
-                    window_title,
-                    url_domain=url_domain,
-                    activity_type=activity_type,
-                    system_state=system_state,
-                )
+                learned_category = self.correction_engine.match_category(app_name, url_domain, window_title)
+                if learned_category:
+                    category = learned_category
+                else:
+                    category = self.categorizer.categorize(
+                        app_name,
+                        window_title,
+                        url_domain=url_domain,
+                        activity_type=activity_type,
+                        system_state=system_state,
+                    )
                 normalized_app = app_name
                 normalized_window = window_title
                 normalized_type = 'active'
@@ -487,15 +641,29 @@ class MuruthiApp(tk.Tk):
                 summary = self.build_daily_summary(today, activities)
                 self.db.insert_daily_summary(summary)
 
-                recommendation = self.recommender.generate_recommendation(summary, activities)
+                history_summaries = self.db.get_daily_summaries(days=14)
+                recommendation_history = self.db.get_recent_recommendation_history(days=7)
+                pattern_data = self.analyze_recent_patterns(days=7)
+
+                recommendation = self.recommender.generate_recommendation(
+                    summary,
+                    activities=activities,
+                    historical_summaries=history_summaries,
+                    recommendation_history=recommendation_history,
+                    pattern_data=pattern_data,
+                )
+                self.current_recommendation = recommendation
                 self.db.insert_daily_recommendation(recommendation)
+                self._log_recommendation_if_new(today, recommendation)
 
                 self.collect_outcome_markers(today)
+                self._capture_state_snapshot(today, activities, pattern_data)
 
-                pattern_data = self.analyze_recent_patterns(days=7)
                 self.update_summary_display(today, activities, pattern_data, recommendation)
                 self.update_insight_display(summary, recommendation, pattern_data)
                 self.update_life_tab()
+                self.refresh_review_tab(silent=True)
+                self.update_trends_tab()
         except Exception as e:
             logger.error(f"Display update error: {e}")
             self._set_stats_text(
@@ -688,6 +856,7 @@ class MuruthiApp(tk.Tk):
         distraction_seconds = sum(a.duration_seconds for a in filtered if (a.category or 'other') in distraction_cats)
 
         focus_by_hour = {h: 0 for h in range(24)}
+        distraction_by_hour = {h: 0 for h in range(24)}
         active_days = set()
 
         for act in filtered:
@@ -695,10 +864,16 @@ class MuruthiApp(tk.Tk):
                 active_days.add(act.start_time.date())
                 if (act.category or 'other') in productive_cats:
                     focus_by_hour[act.start_time.hour] += act.duration_seconds
+                if (act.category or 'other') in distraction_cats:
+                    distraction_by_hour[act.start_time.hour] += act.duration_seconds
 
         best_focus_hour = None
         if any(v > 0 for v in focus_by_hour.values()):
             best_focus_hour = max(focus_by_hour, key=focus_by_hour.get)
+
+        top_distraction_hour = None
+        if any(v > 0 for v in distraction_by_hour.values()):
+            top_distraction_hour = max(distraction_by_hour, key=distraction_by_hour.get)
 
         productive_ratio = (productive_seconds / total_seconds) if total_seconds else 0.0
         distraction_ratio = (distraction_seconds / total_seconds) if total_seconds else 0.0
@@ -708,6 +883,10 @@ class MuruthiApp(tk.Tk):
             end_hour = (best_focus_hour + 1) % 24
             insights.append(f"Best focus window so far: {best_focus_hour:02d}:00-{end_hour:02d}:00.")
 
+        if top_distraction_hour is not None:
+            end_hour = (top_distraction_hour + 1) % 24
+            insights.append(f"Top distraction window: {top_distraction_hour:02d}:00-{end_hour:02d}:00.")
+
         if distraction_ratio > productive_ratio:
             insights.append("Distraction time is currently higher than productive time.")
         else:
@@ -715,11 +894,167 @@ class MuruthiApp(tk.Tk):
 
         return {
             'best_focus_hour': best_focus_hour,
+            'top_distraction_hour': top_distraction_hour,
             'productive_ratio': productive_ratio,
             'distraction_ratio': distraction_ratio,
             'data_days': len(active_days),
             'insights': insights,
         }
+
+    def _log_recommendation_if_new(self, date_str, recommendation):
+        """Persist recommendation history once per date/title in current app session."""
+        key = (date_str, recommendation.title)
+        if self.last_recommendation_logged == key:
+            return
+        self.last_recommendation_logged = key
+        self.last_recommendation_history_id = self.db.insert_recommendation_history(
+            RecommendationHistory(
+                date=date_str,
+                title=recommendation.title,
+                category=recommendation.category,
+                priority=recommendation.priority,
+                reason=recommendation.description,
+            )
+        )
+
+    def mark_recommendation_helpful(self):
+        """Mark current recommendation as helpful (accepted)."""
+        self._set_recommendation_feedback("accepted")
+
+    def mark_recommendation_not_helpful(self):
+        """Mark current recommendation as not helpful (ignored)."""
+        self._set_recommendation_feedback("ignored")
+
+    def _set_recommendation_feedback(self, feedback):
+        """Persist user feedback for current recommendation and refresh history panel."""
+        recommendation = self.current_recommendation
+        if not recommendation:
+            messagebox.showwarning("No recommendation", "No current recommendation available to rate yet.")
+            return
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        updated = self.db.set_recommendation_feedback(
+            feedback=feedback,
+            history_id=self.last_recommendation_history_id,
+            date=today,
+            title=recommendation.title,
+        )
+
+        if not updated:
+            messagebox.showwarning("Feedback", "Could not record feedback for this recommendation.")
+            return
+
+        label = "Helpful" if feedback == "accepted" else "Not Helpful"
+        if hasattr(self, 'recommendation_feedback_status'):
+            self.recommendation_feedback_status.config(text=f"Feedback: {label}")
+        self.update_trends_tab()
+
+    def _capture_state_snapshot(self, date_str, activities, pattern_data):
+        """Persist heuristic state snapshots and transitions for future Markov modeling."""
+        state_label, confidence, features = self.state_engine.infer_state(activities, pattern_data)
+
+        self.db.insert_state_snapshot(
+            StateSnapshot(
+                date=date_str,
+                state_label=state_label,
+                confidence=confidence,
+                feature_json=json.dumps(features),
+            )
+        )
+
+        if self.last_state_label and self.last_state_label != state_label:
+            self.db.insert_state_transition(
+                StateTransition(
+                    date=date_str,
+                    from_state=self.last_state_label,
+                    to_state=state_label,
+                    trigger="auto_inference",
+                )
+            )
+
+        self.last_state_label = state_label
+
+    def update_trends_tab(self):
+        """Render trend analytics, recommendation history, and metric explanations."""
+        if not hasattr(self, 'trends_text'):
+            return
+
+        try:
+            trend_rows = self.db.get_daily_category_trends(days=7)
+            app_summary = self.db.get_app_summary(days=7)
+            domain_summary = self.db.get_domain_summary(days=7)
+            rec_history = self.db.get_recent_recommendation_history(days=14, limit=40)
+
+            trend_lines = ["7-day daily trend snapshot:"]
+            if not trend_rows:
+                trend_lines.append("- No trend data yet.")
+            else:
+                for row in trend_rows[:7]:
+                    total_h = (row.get('total', 0) or 0) / 3600
+                    top_cat = "other"
+                    top_sec = 0
+                    for cat, sec in row.get('categories', {}).items():
+                        if sec > top_sec:
+                            top_cat = cat
+                            top_sec = sec
+                    top_h = top_sec / 3600
+                    trend_lines.append(f"- {row.get('date')}: total {total_h:.1f}h | top {top_cat} ({top_h:.1f}h)")
+
+            trend_lines.append("\nTop categories this week:")
+            weekly_cat = self.db.get_category_summary(days=7)
+            if not weekly_cat:
+                trend_lines.append("- No category data yet.")
+            else:
+                for cat, sec in list(weekly_cat.items())[:6]:
+                    trend_lines.append(f"- {cat}: {sec / 3600:.1f}h")
+
+            trend_lines.append("\nTop apps this week:")
+            if not app_summary:
+                trend_lines.append("- No app data yet.")
+            else:
+                for app, sec in list(app_summary.items())[:6]:
+                    trend_lines.append(f"- {app}: {sec / 3600:.1f}h")
+
+            trend_lines.append("\nTop domains this week:")
+            if not domain_summary:
+                trend_lines.append("- No domain data yet.")
+            else:
+                for domain, sec in list(domain_summary.items())[:6]:
+                    trend_lines.append(f"- {domain}: {sec / 3600:.1f}h")
+
+            self.trends_text.delete(1.0, tk.END)
+            self.trends_text.insert(1.0, "\n".join(trend_lines))
+
+            self.recommendation_history_text.delete(1.0, tk.END)
+            if not rec_history:
+                self.recommendation_history_text.insert(1.0, "No recommendation history yet.")
+            else:
+                lines = []
+                for rec in rec_history:
+                    stamp = rec.created_at.strftime('%Y-%m-%d %H:%M') if hasattr(rec.created_at, 'strftime') else str(rec.created_at)
+                    feedback = (rec.feedback or "").strip().lower()
+                    feedback_text = ""
+                    if feedback == "accepted":
+                        feedback_text = " | feedback: helpful"
+                    elif feedback == "ignored":
+                        feedback_text = " | feedback: not helpful"
+                    lines.append(f"{stamp} | {rec.priority.upper()} | {rec.title} [{rec.category}]{feedback_text}")
+                    if rec.reason:
+                        lines.append(f"  Why: {rec.reason[:140]}")
+                self.recommendation_history_text.insert(1.0, "\n".join(lines))
+
+            self.capture_health_help_text.delete(1.0, tk.END)
+            self.capture_health_help_text.insert(
+                1.0,
+                "Capture Health explanation:\n"
+                "- Unknown rate: lower is better. Fix by keeping active window titles available.\n"
+                "- Idle ratio: high means less active work captured in this window.\n"
+                "- Domain coverage: for browser events, shows how often domain extraction succeeds.\n"
+                "- State coverage: percent of events with system-state context.\n"
+                "- Confidence score: weighted signal quality score across all above metrics."
+            )
+        except Exception as e:
+            logger.error(f"Trend tab update error: {e}")
 
     def objective_progress(self, summary, recommendation, pattern_data):
         """Calculate progress against Muruthi's 4 core objectives."""
@@ -822,6 +1157,8 @@ class MuruthiApp(tk.Tk):
                 f"Priority: {recommendation.priority}"
             )
             self.insight_text.insert(1.0, text)
+            if hasattr(self, 'recommendation_feedback_status'):
+                self.recommendation_feedback_status.config(text="Feedback: pending")
         except Exception as e:
             logger.error(f"Insight error: {e}")
             self.insight_text.insert(1.0, "Generate insights by tracking more activities.")
@@ -902,6 +1239,126 @@ class MuruthiApp(tk.Tk):
                     f"{ev.event_date} | {ev.event_type}/{ev.impact_level} | {ev.title}\n  {ev.description}"
                 )
             self.life_events_text.insert(1.0, "\n\n".join(lines))
+
+    def refresh_review_tab(self, silent=False):
+        """Reload review events and correction history based on filters."""
+        if not hasattr(self, 'review_tree'):
+            return
+
+        days = int(self.review_days_var.get() or "1")
+        category = self.review_category_var.get() or "all"
+        search_text = (self.review_search_var.get() or "").strip()
+
+        events = self.db.get_recent_activities_for_review(
+            days=days,
+            limit=500,
+            category=category,
+            search_text=search_text,
+        )
+        self.current_review_events = events
+
+        for item in self.review_tree.get_children():
+            self.review_tree.delete(item)
+
+        for ev in events:
+            start_time = ev.get('start_time', '')
+            time_str = start_time[11:16] if isinstance(start_time, str) and len(start_time) >= 16 else ""
+            duration = f"{int(ev.get('duration_seconds', 0)) // 60}m"
+            corrected = "yes" if ev.get('is_corrected') else "no"
+            self.review_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    ev.get('id'),
+                    time_str,
+                    ev.get('app_name', ''),
+                    ev.get('category', 'other'),
+                    duration,
+                    ev.get('url_domain', ''),
+                    corrected,
+                    (ev.get('window_title', '') or '')[:140],
+                ),
+            )
+
+        history = self.db.get_correction_history(limit=60)
+        self.review_history_text.delete(1.0, tk.END)
+        if not history:
+            self.review_history_text.insert(1.0, "No corrections yet.")
+        else:
+            lines = []
+            for row in history:
+                stamp = row.created_at.strftime('%Y-%m-%d %H:%M') if hasattr(row.created_at, 'strftime') else str(row.created_at)
+                lines.append(
+                    f"{stamp} | activity #{row.activity_id}: {row.old_category} -> {row.new_category}"
+                    + (f" | {row.reason}" if row.reason else "")
+                )
+            self.review_history_text.insert(1.0, "\n".join(lines))
+
+        if not silent:
+            messagebox.showinfo("Review", f"Loaded {len(events)} events for review.")
+
+    def apply_review_correction(self):
+        """Apply manual category corrections to selected review rows."""
+        selected = self.review_tree.selection() if hasattr(self, 'review_tree') else []
+        if not selected:
+            messagebox.showwarning("No selection", "Select one or more events to correct.")
+            return
+
+        activity_ids = []
+        for item in selected:
+            values = self.review_tree.item(item, 'values')
+            if values and values[0]:
+                activity_ids.append(int(values[0]))
+
+        if not activity_ids:
+            messagebox.showwarning("No IDs", "Could not resolve selected activity IDs.")
+            return
+
+        new_category = (self.correct_to_category_var.get() or '').strip()
+        if not new_category:
+            messagebox.showwarning("Missing category", "Choose a target category.")
+            return
+
+        reason = (self.correction_reason_var.get() or '').strip()
+        updated = self.db.apply_category_correction(
+            activity_ids=activity_ids,
+            new_category=new_category,
+            reason=reason,
+            learn_app_rule=bool(self.learn_app_var.get()),
+            learn_domain_rule=bool(self.learn_domain_var.get()),
+        )
+        self.correction_engine.reload_rules()
+        self.refresh_review_tab(silent=True)
+        self.update_display()
+        messagebox.showinfo("Correction applied", f"Updated {updated} activities to '{new_category}'.")
+
+    def export_review_events_csv(self):
+        """Export currently filtered review events to CSV with optional sanitization."""
+        events = self.current_review_events or []
+        if not events:
+            messagebox.showwarning("No events", "No filtered events available to export.")
+            return
+
+        path = self.export_service.export_events_csv(
+            events,
+            sanitize_titles=bool(self.sanitize_titles_var.get()),
+            sanitize_domains=bool(self.sanitize_domains_var.get()),
+        )
+        messagebox.showinfo("Export complete", f"CSV exported to:\n{path}")
+
+    def export_review_events_json(self):
+        """Export currently filtered review events to JSON with optional sanitization."""
+        events = self.current_review_events or []
+        if not events:
+            messagebox.showwarning("No events", "No filtered events available to export.")
+            return
+
+        path = self.export_service.export_events_json(
+            events,
+            sanitize_titles=bool(self.sanitize_titles_var.get()),
+            sanitize_domains=bool(self.sanitize_domains_var.get()),
+        )
+        messagebox.showinfo("Export complete", f"JSON exported to:\n{path}")
     
     def on_close(self):
         self.running = False
