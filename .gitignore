@@ -1,0 +1,20 @@
+# Muruthi Project
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+.env
+.venv
+venv/
+env/
+*.db
+*.sqlite
+data/*
+!data/.gitkeep
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
