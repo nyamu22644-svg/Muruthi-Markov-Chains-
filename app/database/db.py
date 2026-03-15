@@ -1172,6 +1172,83 @@ class Database:
             print(f"Set recommendation feedback error: {e}")
             return False
 
+    def get_recommendation_feedback_stats(self, days: int = 30) -> Dict[str, List[Dict]]:
+        """Aggregate recommendation feedback metrics by title and category."""
+        try:
+            start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+            self.cursor.execute(
+                """
+                SELECT
+                    category,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN feedback = 'accepted' THEN 1 ELSE 0 END) AS accepted,
+                    SUM(CASE WHEN feedback = 'ignored' THEN 1 ELSE 0 END) AS ignored
+                FROM recommendation_history
+                WHERE date >= ?
+                GROUP BY category
+                ORDER BY total DESC
+                """,
+                (start_date,),
+            )
+            cat_rows = self.cursor.fetchall()
+
+            self.cursor.execute(
+                """
+                SELECT
+                    title,
+                    category,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN feedback = 'accepted' THEN 1 ELSE 0 END) AS accepted,
+                    SUM(CASE WHEN feedback = 'ignored' THEN 1 ELSE 0 END) AS ignored
+                FROM recommendation_history
+                WHERE date >= ?
+                GROUP BY title, category
+                ORDER BY total DESC, accepted DESC
+                LIMIT 25
+                """,
+                (start_date,),
+            )
+            title_rows = self.cursor.fetchall()
+
+            def _to_stat_dict(row):
+                total = int(row["total"] or 0)
+                accepted = int(row["accepted"] or 0)
+                ignored = int(row["ignored"] or 0)
+                accepted_rate = (accepted / total) if total > 0 else 0.0
+                ignored_rate = (ignored / total) if total > 0 else 0.0
+                return {
+                    "total": total,
+                    "accepted": accepted,
+                    "ignored": ignored,
+                    "accepted_rate": accepted_rate,
+                    "ignored_rate": ignored_rate,
+                }
+
+            by_category = []
+            for row in cat_rows:
+                stat = _to_stat_dict(row)
+                stat["category"] = row["category"] or "other"
+                by_category.append(stat)
+
+            by_title = []
+            for row in title_rows:
+                stat = _to_stat_dict(row)
+                stat["title"] = row["title"] or ""
+                stat["category"] = row["category"] or "other"
+                by_title.append(stat)
+
+            return {
+                "by_category": by_category,
+                "by_title": by_title,
+            }
+        except sqlite3.Error as e:
+            print(f"Get recommendation feedback stats error: {e}")
+            return {
+                "by_category": [],
+                "by_title": [],
+            }
+
     def insert_state_snapshot(self, snapshot: StateSnapshot) -> int:
         """Insert a state snapshot for future transition modeling."""
         try:

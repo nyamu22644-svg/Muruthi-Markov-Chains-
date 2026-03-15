@@ -51,7 +51,8 @@ class Recommender:
                                activities: List[Activity] = None,
                                historical_summaries: List[DailySummary] = None,
                                recommendation_history: List[RecommendationHistory] = None,
-                               pattern_data: Dict = None) -> DailyRecommendation:
+                               pattern_data: Dict = None,
+                               feedback_stats: Dict = None) -> DailyRecommendation:
         """
         Generate a single daily recommendation
         
@@ -91,6 +92,7 @@ class Recommender:
         historical_summaries = historical_summaries or []
         recommendation_history = recommendation_history or []
         pattern_data = pattern_data or {}
+        feedback_stats = feedback_stats or {"by_category": [], "by_title": []}
 
         multi_day = self._compute_multi_day_features(historical_summaries)
         
@@ -258,7 +260,7 @@ class Recommender:
             )
             candidates.append((recommendation, self.rule_weights["default_positive"]))
 
-        candidates = self._apply_repetition_suppression(candidates, recommendation_history)
+        candidates = self._apply_repetition_suppression(candidates, recommendation_history, feedback_stats)
         
         # Pick best recommendation by weight (if multiple match, pick highest priority)
         if candidates:
@@ -278,6 +280,7 @@ class Recommender:
         self,
         candidates: List[Tuple[DailyRecommendation, int]],
         recommendation_history: List[RecommendationHistory],
+        feedback_stats: Dict,
     ) -> List[Tuple[DailyRecommendation, int]]:
         """Penalize repetition and adapt scores based on accepted/ignored feedback."""
         if not candidates or not recommendation_history:
@@ -303,6 +306,15 @@ class Recommender:
                 category_feedback[category_key] = category_feedback.get(category_key, 0) + 1
 
         adjusted = []
+        category_stats = {
+            (item.get("category") or "other").strip().lower(): item
+            for item in (feedback_stats.get("by_category") or [])
+        }
+        title_stats = {
+            (item.get("title") or "").strip().lower(): item
+            for item in (feedback_stats.get("by_title") or [])
+        }
+
         for rec, weight in candidates:
             title_key = (rec.title or "").strip().lower()
             category_key = (rec.category or "other").strip().lower()
@@ -317,7 +329,32 @@ class Recommender:
             category_delta_raw = category_feedback.get(category_key, 0)
             category_delta = max(-2, min(2, category_delta_raw))
 
-            tuned = weight - repetition_penalty - ignore_penalty + acceptance_bonus + category_delta
+            acceptance_rate_bonus = 0
+            ignore_rate_penalty = 0
+
+            cstat = category_stats.get(category_key)
+            if cstat and cstat.get("total", 0) >= 3:
+                if cstat.get("accepted_rate", 0.0) >= 0.60:
+                    acceptance_rate_bonus += 2
+                if cstat.get("ignored_rate", 0.0) >= 0.50:
+                    ignore_rate_penalty += 2
+
+            tstat = title_stats.get(title_key)
+            if tstat and tstat.get("total", 0) >= 2:
+                if tstat.get("accepted_rate", 0.0) >= 0.60:
+                    acceptance_rate_bonus += 1
+                if tstat.get("ignored_rate", 0.0) >= 0.50:
+                    ignore_rate_penalty += 1
+
+            tuned = (
+                weight
+                - repetition_penalty
+                - ignore_penalty
+                - ignore_rate_penalty
+                + acceptance_bonus
+                + acceptance_rate_bonus
+                + category_delta
+            )
             adjusted.append((rec, max(1, tuned)))
 
         # If everything is heavily penalized, still keep all candidates and let normal sorting pick best.

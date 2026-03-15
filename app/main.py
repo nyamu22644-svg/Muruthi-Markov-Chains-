@@ -643,6 +643,7 @@ class MuruthiApp(tk.Tk):
 
                 history_summaries = self.db.get_daily_summaries(days=14)
                 recommendation_history = self.db.get_recent_recommendation_history(days=7)
+                feedback_stats = self.db.get_recommendation_feedback_stats(days=30)
                 pattern_data = self.analyze_recent_patterns(days=7)
 
                 recommendation = self.recommender.generate_recommendation(
@@ -651,6 +652,7 @@ class MuruthiApp(tk.Tk):
                     historical_summaries=history_summaries,
                     recommendation_history=recommendation_history,
                     pattern_data=pattern_data,
+                    feedback_stats=feedback_stats,
                 )
                 self.current_recommendation = recommendation
                 self.db.insert_daily_recommendation(recommendation)
@@ -984,6 +986,7 @@ class MuruthiApp(tk.Tk):
             app_summary = self.db.get_app_summary(days=7)
             domain_summary = self.db.get_domain_summary(days=7)
             rec_history = self.db.get_recent_recommendation_history(days=14, limit=40)
+            feedback_stats = self.db.get_recommendation_feedback_stats(days=30)
 
             trend_lines = ["7-day daily trend snapshot:"]
             if not trend_rows:
@@ -1021,6 +1024,32 @@ class MuruthiApp(tk.Tk):
             else:
                 for domain, sec in list(domain_summary.items())[:6]:
                     trend_lines.append(f"- {domain}: {sec / 3600:.1f}h")
+
+            trend_lines.append("\nRecommendation feedback by category (30d):")
+            by_category = feedback_stats.get("by_category", [])
+            if not by_category:
+                trend_lines.append("- No feedback yet.")
+            else:
+                for row in by_category[:8]:
+                    trend_lines.append(
+                        f"- {row.get('category', 'other')}: "
+                        f"accepted {row.get('accepted_rate', 0.0) * 100:.0f}% "
+                        f"({row.get('accepted', 0)}/{row.get('total', 0)}) | "
+                        f"ignored {row.get('ignored_rate', 0.0) * 100:.0f}%"
+                    )
+
+            trend_lines.append("\nTop recommendation acceptance (30d):")
+            by_title = feedback_stats.get("by_title", [])
+            if not by_title:
+                trend_lines.append("- No recommendation feedback entries yet.")
+            else:
+                ranked = sorted(by_title, key=lambda r: (r.get('accepted_rate', 0.0), r.get('total', 0)), reverse=True)
+                for row in ranked[:6]:
+                    trend_lines.append(
+                        f"- {row.get('title', '')} [{row.get('category', 'other')}]: "
+                        f"{row.get('accepted_rate', 0.0) * 100:.0f}% accepted "
+                        f"({row.get('accepted', 0)}/{row.get('total', 0)})"
+                    )
 
             self.trends_text.delete(1.0, tk.END)
             self.trends_text.insert(1.0, "\n".join(trend_lines))
